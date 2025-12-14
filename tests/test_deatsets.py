@@ -1,87 +1,115 @@
+import os
+import sys
 import torch
 from torch.utils.data import DataLoader
-import sys
-import os
 
-# 1. 路径 Hack: 确保能导入 datasets 和 models
-# 假设脚本在 MFSim 根目录下运行，如果不是，请调整这里的路径
-sys.path.append(os.getcwd()) 
+sys.path.append(os.getcwd())
 
-try:
-    from training.datasets import StateDataset, trajectory_collate
-except ImportError:
-    print("导入失败，请检查你的目录结构。确保 datasets.py 在 training/ 文件夹下")
-    sys.exit(1)
+from training.datasets import StateTransitionDataset
 
-def test_datasets_pipeline():
-    print("=== 开始测试 Dataset 数据流 ===")
-    
-    # 2. 模拟配置
-    # 注意：为了测试快一点，如果不方便加载 BERT，可以把 type 改成 'gru' 或者 mock
-    # 但为了验证真实维度，建议还是加载 BERT
+
+def test_dataset_basic():
+    print("=== [Test 1] Dataset 基本功能测试 ===")
+
     encoder_config = {
-        "type": "bert", 
-        "model_name": "bert-base-chinese", # 假设数据是中文
+        "type": "bert",
+        "model_name": "bert-base-chinese",
         "output_dim": 768,
         "freeze": True
     }
-    
-    # 3. 实例化 Dataset
-    # 请替换为你真实的文件路径
-    traj_path = "/root/ICML/data/test_state_distribution/10031994215_trajectory.csv"
-    mf_path = "/root/ICML/data/test_mf/10031994215_mf.csv"
-    profile_path = "/root/ICML/data/profile/cluster_core_user_profile.jsonl"
-    
-    if not os.path.exists(traj_path):
-        print(f"❌ 找不到文件: {traj_path}，请修改路径")
-        return
 
-    print("正在初始化 Dataset (这可能需要几秒钟加载 BERT)...")
-    dataset = StateDataset(
-        trajectory_path=traj_path,
-        mf_path=mf_path,
-        profile_path=profile_path,
-        encoder_config=encoder_config
+    file_config = {
+        "uid_mapping_path": "/root/ICML/data/profile/user_clusters_map.csv",
+        "cluser_user_profile": "/root/ICML/data/profile/cluster_core_user_profile.jsonl",
+        "cluster_info_path": "/root/ICML/data/profile/cluster_details.json"
+    }
+
+    dataset = StateTransitionDataset(
+        trajectory_path="/root/ICML/data/test_state_distribution/10031994215_trajectory.csv",
+        mf_path="/root/ICML/data/test_mf/10031994215_mf.csv",
+        test_data_path="/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test/10031994215.json",
+        profile_path=file_config["cluser_user_profile"],
+        encoder_config=encoder_config,
+        file_config=file_config,
+        batch_size=16
     )
-    
-    print(f"✅ Dataset 初始化成功! 总样本数: {len(dataset)}")
-    
-    # 4. 测试单个样本 (__getitem__)
-    print("\n--- 测试单个样本 (Index 0) ---")
+
+    print(f"✅ Dataset 初始化成功，总长度: {len(dataset)}")
+
+    print("\n--- 取第 0 个样本 ---")
     item = dataset[0]
-    
-    print(f"Keys: {item.keys()}")
-    print(f"Profile Vec Shape: {item['profile_vec'].shape} (期望: [768])")
-    print(f"MF Text Preview: {item['mf_text'][:20]}...")
-    print(f"Label: {item['label']} (类型: {type(item['label'])})")
-    
-    # 检查向量是否全是 0 (意味着 ID 没匹配上)
-    if torch.sum(item['profile_vec']) == 0:
-        print("⚠️ 警告: Profile Vector 全为 0。这意味着 Trajectory 里的 user_id 在 JSONL 里没找到。")
-    else:
-        print("✅ Profile Vector 数据正常 (非零)。")
 
-    # 5. 测试 DataLoader (__collate_fn__)
-    print("\n--- 测试 Batch Loading (Batch Size = 4) ---")
-    loader = DataLoader(
-        dataset, 
-        batch_size=4, 
-        shuffle=True, 
-        collate_fn=trajectory_collate
+    # ====== Key 检查 ======
+    expected_keys = {"mu_prev", "mf_text", "profile_vecs", "target_dist"}
+    print("Keys:", item.keys())
+    assert set(item.keys()) == expected_keys, "❌ 返回字段不匹配"
+
+    # ====== 形状检查 ======
+    print("mu_prev:", item["mu_prev"].shape)
+    print("target_dist:", item["target_dist"].shape)
+    print("profile_vecs:", item["profile_vecs"].shape)
+
+    assert item["mu_prev"].shape == (3,)
+    assert item["target_dist"].shape == (3,)
+    assert item["profile_vecs"].ndim == 2
+    assert item["profile_vecs"].shape[1] == 768
+
+    # ====== NaN / 全 0 检查 ======
+    if torch.isnan(item["profile_vecs"]).any():
+        print("❌ profile_vecs 含 NaN")
+    elif torch.sum(item["profile_vecs"]) == 0:
+        print("⚠️ profile_vecs 全 0，说明 uid → profile 映射失败")
+    else:
+        print("✅ profile_vecs 数值正常")
+
+    print("MF Text Preview:", item["mf_text"][:50])
+    print("✅ 单样本测试通过")
+
+
+def test_dataloader():
+    print("\n=== [Test 2] DataLoader 测试 ===")
+
+    encoder_config = {
+        "type": "bert",
+        "model_name": "bert-base-chinese",
+        "output_dim": 768,
+        "freeze": True
+    }
+
+    file_config = {
+        "uid_mapping_path": "/root/ICML/data/profile/user_clusters_map.csv",
+        "cluser_user_profile": "/root/ICML/data/profile/cluster_core_user_profile.jsonl",
+        "cluster_info_path": "/root/ICML/data/profile/cluster_details.json"
+    }
+
+    dataset = StateTransitionDataset(
+        trajectory_path="/root/ICML/data/test_state_distribution/10031994215_trajectory.csv",
+        mf_path="/root/ICML/data/test_mf/10031994215_mf.csv",
+        test_data_path="/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test/10031994215.json",
+        profile_path=file_config["cluser_user_profile"],
+        encoder_config=encoder_config,
+        file_config=file_config,
+        batch_size=16
     )
-    
-    try:
-        batch = next(iter(loader))
-        print("Batch 读取成功!")
-        print(f"Batch Profile Vecs: {batch['profile_vecs'].shape} (期望: [4, 768])")
-        print(f"Batch Labels: {batch['labels'].shape} (期望: [4])")
-        print(f"Batch MF Texts 数量: {len(batch['mf_texts'])} (期望: 4)")
-        print(f"Batch Mu Prev: {batch['mu_prev'].shape} (期望: [4, 3])")
-        print("✅ Collate 函数工作正常")
-    except Exception as e:
-        print(f"❌ Batch 处理失败: {e}")
-        import traceback
-        traceback.print_exc()
+
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False
+    )
+
+    batch = next(iter(loader))
+
+    print("Batch keys:", batch.keys())
+    print("mu_prev:", batch["mu_prev"].shape)         # (4, 3)
+    print("target_dist:", batch["target_dist"].shape) # (4, 3)
+    print("profile_vecs:", batch["profile_vecs"].shape)
+    # 期望: (4, 16, 768)
+
+    assert batch["profile_vecs"].shape[1:] == (16, 768)
+    print("✅ DataLoader 测试通过")
+
 
 if __name__ == "__main__":
-    test_datasets_pipeline()
+    test_dataset_basic()
+    test_dataloader()

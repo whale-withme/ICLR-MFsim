@@ -1,4 +1,5 @@
 import json
+import logging
 import pandas as pd
 import torch
 import random
@@ -6,10 +7,17 @@ import os
 from torch.utils.data import Dataset
 from typing import Dict, List
 
+logging.basicConfig(
+    # level=logging.INFO,  # 或 DEBUG/ERROR
+    # format='[%(asctime)s] %(levelname)s %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
 # 假设 encoders 在 models 目录下
 from model.state_transition.encoders import build_text_encoder
 
-class TrajectoryClusterDataset(Dataset):
+class StateTransitionDataset(Dataset):
     def __init__(
         self,
         trajectory_path: str,       # 10031994215_trajectory.csv (Ground Truth 分布)
@@ -17,11 +25,19 @@ class TrajectoryClusterDataset(Dataset):
         test_data_path: str,        # 4264473811.json (真实用户流, 包含 uid)
         profile_path: str,          # cluster_core_user_profile.jsonl (核心用户池)
         encoder_config: dict,
-        uid_mapping_path: str = None, # [关键] uid -> cluster 的映射文件 (json)
+        file_config: dict,
         batch_size: int = 16
     ):
+        """
+        self.cluser_user_profile: 核心用户的画像
+        self.uid_map: id -> cluster id 
+        self.cluster_info: 保存聚类中的用户信息
+        """
         self.batch_size = batch_size
-        
+        self.cluser_user_profile = file_config['cluser_user_profile']
+        self.cluster_info = file_config['cluster_info_path']
+        self.text_encoder = build_text_encoder(encoder_config)
+
         # 1. 加载grouond truth状态分布
         self.traj_df = pd.read_csv(trajectory_path)
         
@@ -44,112 +60,116 @@ class TrajectoryClusterDataset(Dataset):
         # 4. 加载并向量化核心用户画像 (构建聚类池)
         # TODO: 已经做了聚类，这里应该是映射
         print("正在构建核心用户聚类池...")
-        self.cluster_pools = self._build_cluster_pools(profile_path, encoder_config)
-        self.available_clusters = list(self.cluster_pools.keys())
-        print(f"✅ 聚类池构建完成: 共有 {len(self.available_clusters)} 个类 ({self.available_clusters})")
+        df = pd.read_csv(file_config['uid_mapping_path'])
+        df.drop_duplicates(subset=['uid'])
+        self.uid_map = dict(zip(df['uid'], df['cluster_id']))
         
-        # 5. 加载 UID -> Cluster 映射
-        self.uid_map = self._load_or_mock_mapping(uid_mapping_path)
 
-    # def _build_cluster_pools(self, jsonl_path, config) -> Dict[str, List[torch.Tensor]]:
-    #     """
-    #     读取画像 -> BERT编码 -> 按 'stance_label' 分组存储
-    #     Returns: { '温和建制派': [Tensor1, Tensor2...], ... }
-    #     """
-    #     raw_profiles = []
-    #     with open(jsonl_path, 'r', encoding='utf-8') as f:
-    #         # 修复可能存在的 }{ 粘连
-    #         content = f.read().replace('}{', '}\n{')
-    #         for line in content.split('\n'):
-    #             if not line.strip(): continue
-    #             try:
-    #                 item = json.loads(line)
-    #                 # 提取聚类标签 (优先用 stance_label)
-    #                 label = item.get('stance_label', 'unknown')
-    #                 # 提取描述文本
-    #                 desc = item.get('persona_description') or item.get('desc', "")
-    #                 if desc:
-    #                     raw_profiles.append({'label': label, 'text': desc})
-    #             except:
-    #                 continue
+    def _uid2profile(self, uid):
+        """
+        uid -> cluster id -> random cluster user profile，也避免了某些类中的用户信息不全的问题
+        1. 根据uid查找其cluster_id。
+        2. 从cluster_info文件中获取该类所有用户uid。
+        3. 随机打乱这些uid，依次在画像文件中查找，找到第一个有画像的用户就返回。
+        """
+        profile_path = self.cluser_user_profile
+        cluster_info_path = self.cluster_info
+        cluster_id = self.uid_map.get(uid)
+        logger.info(f"[uid2profile] 输入uid: {uid}, 查到cluster_id: {cluster_id}")
+        if not cluster_id:
+            logger.error(f"[uid2profile] uid {uid} 没有找到对应的 cluster_id")
+            cluster_id = random.randint(0, 19)
+        
+        # 1. 获取该类所有用户uid
+        cluster_users = []
+        if cluster_info_path and os.path.exists(cluster_info_path):
+            with open(cluster_info_path, 'r', encoding='utf-8') as f:
+                cluster_list = json.load(f)
+                for c in cluster_list:
+                    if str(c.get('cluster_id')) == str(int(cluster_id)):
+                        cluster_users = [str(u['uid']) for u in c.get('typical_users', [])]
+                        logger.info(f"[uid2profile] cluster_id: {cluster_id} typical_users: {cluster_users}")
+                        break
+        if not cluster_users:
+            logger.error(f"[uid2profile] cluster_id {cluster_id} 没有 typical_users")
+            return None
 
-    #     # 批量编码
-    #     pools = {}
-    #     encoder = build_text_encoder(config)
-    #     encoder.eval()
-    #     device = "cuda" if torch.cuda.is_available() else "cpu"
-    #     encoder.to(device)
-        
-    #     batch_size = 32
-    #     texts = [p['text'] for p in raw_profiles]
-    #     labels = [p['label'] for p in raw_profiles]
-        
-    #     all_vecs = []
-    #     with torch.no_grad():
-    #         for i in range(0, len(texts), batch_size):
-    #             batch_txt = texts[i : i+batch_size]
-    #             if config['type'] == 'bert':
-    #                 inputs = encoder.tokenizer(batch_txt, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-    #                 emb = encoder(inputs['input_ids'], inputs['attention_mask'])
-    #             else:
-    #                 emb = torch.randn(len(batch_txt), config.get('emb_dim', 256))
-    #             all_vecs.append(emb.cpu())
-        
-    #     # 分组存储
-    #     flat_vecs = torch.cat(all_vecs, dim=0)
-    #     for label, vec in zip(labels, flat_vecs):
-    #         if label not in pools:
-    #             pools[label] = []
-    #         pools[label].append(vec)
-            
-    #     return pools
+        # 2. 读取画像文件，建立uid->profile映射
+        uid2profile = {}
+        if profile_path and os.path.exists(profile_path):
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                line_count = 0
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    uid_profile = str(obj.get('user_id'))
+                    uid2profile[uid_profile] = obj
+                    line_count += 1
+                # logger.info(f"[uid2profile] 画像文件共加载 {line_count} 条, uid2profile keys样例: {list(uid2profile.keys())[:5]}")
 
-    def _load_or_mock_mapping(self, path):
-        """加载 UID 映射，如果没有则生成随机映射（仅供测试！）"""
-        if path and os.path.exists(path):
-            with open(path, 'r') as f:
-                return json.load(f)
-        else:
-            print(f"⚠️ 警告: 未找到 UID 映射文件 ({path})。将为测试用户随机分配聚类标签以跑通代码。")
-            mock_map = {}
-            for u in self.test_users:
-                # 这里的 key 必须和 test_users 里的 uid 类型一致 (建议统一转 str)
-                uid = str(u.get('uid', ''))
-                mock_map[uid] = random.choice(self.available_clusters)
-            return mock_map
+        # 3. 随机遍历用户，找到第一个有画像的
+        random.shuffle(cluster_users)
+        logger.info(f"[uid2profile] cluster_users 随机顺序: {cluster_users}")
+        for u in cluster_users:
+            if u in uid2profile:
+                logger.info(f"[uid2profile] 命中: {u}, 返回profile")
+                return uid2profile[u]
+
+        logger.error(f"[uid2profile] cluster_id {cluster_id} 所有 typical_users 都没有画像")
+        return None
+    
+    def _text2vector(self, input):
+        """文本转换向量"""
+        inputs = self.text_encoder.tokenizer(
+            input, return_tensors='pt', padding='max_length', truncation=True, max_length=256
+        )
+        with torch.no_grad():
+            vec = self.text_encoder(
+                inputs['input_ids'], inputs['attention_mask']
+            )[0]
+
+        return vec
 
     def __len__(self):
         return len(self.traj_df)
 
     def __getitem__(self, idx):
+        """
+        datasets item:
+        {
+            "mu_prev": Tensor(3,),
+            "mf_text": str,
+            "profile_vecs": Tensor(batch_size, hidden_dim),
+            "target_dist": Tensor(3,)
+        }
+        """
         # 1. 获取当前 Batch 对应的测试用户片段
         # 逻辑：Trajectory 的每一行代表一个 Time Step，包含 batch_size 个新用户行为
-        # 我们使用循环读取：假设 Test Set 是一个无限流
-        start_idx = (idx * self.batch_size) % len(self.test_users)
+        start_idx = idx * self.batch_size
         
         batch_profiles = []
         
         for i in range(self.batch_size):
-            # 获取真实用户的 UID
             curr_idx = (start_idx + i) % len(self.test_users)
             user_item = self.test_users[curr_idx]
             uid = str(user_item.get('uid', ''))
-            
-            # [核心逻辑] UID -> Cluster -> Random Profile
-            cluster_label = self.uid_map.get(uid)
-            
-            # 容错：如果映射表里没这个uid，或者该类没画像，随机选一个兜底
-            if not cluster_label or cluster_label not in self.cluster_pools:
-                cluster_label = random.choice(self.available_clusters)
-            
-            # 从该类中随机采样一个画像向量
-            profile_vec = random.choice(self.cluster_pools[cluster_label])
-            batch_profiles.append(profile_vec)
-            
+
+            text_profile = self._uid2profile(uid)
+            print(uid)
+            if text_profile is not None:
+                vector_profile = self._text2vector(
+                    text_profile['stance_nuance']
+                    + '，'.join(text_profile['expression_style'])
+                    + text_profile['persona_description']
+                )
+                batch_profiles.append(vector_profile)
+            else:
+                logger.error("user profile is None")
         # 堆叠画像向量 (16, Hidden_Dim)
         profile_vecs_tensor = torch.stack(batch_profiles)
 
-        # 2. 获取其他信息 (Target Dist, MF Text, Prev Dist)
+        # 2. 处理状态分布输入
         row = self.traj_df.iloc[idx]
         target_dist = torch.tensor([
             row['batch_ratio_pos'], row['batch_ratio_neu'], row['batch_ratio_neg']
@@ -164,8 +184,7 @@ class TrajectoryClusterDataset(Dataset):
                 prev_row['cum_ratio_pos'], prev_row['cum_ratio_neu'], prev_row['cum_ratio_neg']
             ], dtype=torch.float32)
             
-        # 舆论文本
-        mf_text = str(self.mf_texts[idx % len(self.mf_texts)])
+        mf_text = str(self.mf_texts[(idx * self.batch_size + 1) % len(self.mf_texts)])
 
         return {
             "mu_prev": mu_prev,
