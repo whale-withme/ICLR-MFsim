@@ -4,114 +4,211 @@
 import os
 import sys
 import argparse
-from dataclasses import dataclass
-from typing import Any, Dict
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from transformers import AutoTokenizer  # 如果用 BERT
 
-# 让 "MFSim" 根目录加入 sys.path，方便用绝对导入
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 
+# 假设 encoders 和 dataset 都在正确位置
 from model.state_transition.encoders import build_text_encoder
 from model.state_transition.state_transition_net import StateTransitionNet
+from datasets import StateTransitionDataset  # 引用你修改后的 Dataset
 
-
-# ============================================================
-# 配置结构（你可以以后改成读 YAML）
-# ============================================================
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TrainConfig:
-    # 模型
-    encoder_type: str = "gru"        # "gru" 或 "bert"
-    vocab_size: int = 50000          # 仅对 GRU encoder 有用
-    text_emb_dim: int = 256
-    agent_feat_dim: int = 32
+    # --- 目录配置 ---
+    event_data_dir: str = "/root/Mean-Field-LLM/mf_llm/data/rumdect/Weibo/test"
+    mf_dir: str = "/root/ICML/data/test_mf"
+    state_trajectory_dir: str = "/root/ICML/data/test_state_distribution"
+    
+    # --- 全局共享文件 (所有事件共用) ---
+    profile_path: str = "data/cluster_core_user_profile.jsonl"
+    uid_mapping_path: str = "data/uid_mapping.csv"
+    cluster_info_path: str = "data/cluster_info.json"
+
+    # --- 模型与训练参数 (保持不变) ---
+    encoder_type: str = "bert"
+    model_name: str = "bert-base-chinese"
+    text_emb_dim: int = 768
+    agent_feat_dim: int = 768
     hidden_dim: int = 256
-    use_layernorm: bool = False
-
-    # 训练
-    batch_size: int = 16
-    num_epochs: int = 10
-    lr: float = 1e-3
-    weight_decay: float = 0.0
+    use_layernorm: bool = True
+    
+    train_batch_size: int = 32
+    num_agents: int = 16 
+    num_epochs: int = 20
+    lr: float = 2e-5
+    weight_decay: float = 1e-5
     grad_clip: float = 1.0
-
-    # 设备 & 日志 & 保存
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     log_interval: int = 10
     save_dir: str = os.path.join(ROOT_DIR, "checkpoints")
-    save_name: str = "state_transition.pt"
+    save_name: str = "state_transition_best.pt"
 
+import glob
+from torch.utils.data import ConcatDataset
 
-# ============================================================
-# 这里假设你已经在 training/datasets.py 中实现了 Dataset
-# 和 DataLoader 构造函数，batch 的结构是：
-# {
-#   "mu_prev": (B, 3),
-#   "mu_t": (B, 3),
-#   "text_ids": (B, L_max),
-#   "attention_mask": (B, L_max),
-#   "agent_features_list": [ (N_i, d_u) for i in batch ]
-# }
-# ============================================================
-
-def build_dataloader(cfg: TrainConfig) -> DataLoader:
-    """
-    你需要在 training/datasets.py 中实现：
-      - MeanFieldDataset
-      - collate_fn
-      - build_state_transition_dataset_or_loader(...)
-    这里先放一个占位示例，你可以改成自己的实现。
-    """
-    from training.datasets import StateDataset, collate_fn, build_state_transition_dataset  # 自己实现
-
-    dataset = build_state_transition_dataset()  # 你自己定义如何构建
+def build_dataloader(cfg: TrainConfig, tokenizer) -> DataLoader:
+    # 构建包含所有文件的巨型 Dataset
+    full_dataset = build_full_dataset(cfg)
+    
     loader = DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
+        full_dataset,
+        batch_size=cfg.train_batch_size, # 这里是 32
+        shuffle=True, # 这一步很关键！它会打乱不同事件里的样本
+        num_workers=4, # 此时可以开启多进程加速读取
+        pin_memory=True
     )
+    
     return loader
 
+def build_full_dataset(cfg: TrainConfig):
+    """
+    1. 扫描 event_data_dir 下所有的 .json 文件 (视作 test_data)
+    2. 提取 ID (例如 4264473811)
+    3. 检查对应的 _trajectory.csv 和 _mf.csv 是否存在
+    4. 如果齐全，创建该 ID 的 Dataset
+    5. 最后用 ConcatDataset 把所有 ID 的 Dataset 合并
+    """
+    
+    # 1. 找到所有 json 文件作为锚点
+    json_pattern = os.path.join(cfg.event_data_dir, "*.json")
+    json_files = glob.glob(json_pattern)
+    
+    if not json_files:
+        raise ValueError(f"未在 {cfg.event_data_dir} 下找到任何 .json 文件")
 
-# ============================================================
-# 构建模型
-# ============================================================
-
-def build_models(cfg: TrainConfig):
-    # 文本编码器配置
-    encoder_config: Dict[str, Any] = {
+    dataset_list = []
+    
+    # 准备传给 dataset 的全局配置 (profile, uid_map 等)
+    file_config = {
+        'cluser_user_profile': cfg.profile_path,
+        'uid_mapping_path': cfg.uid_mapping_path,
+        'cluster_info_path': cfg.cluster_info_path
+    }
+    
+    # Encoder config (假设 dataset 内部需要)
+    encoder_config = {
         "type": cfg.encoder_type,
+        "model_name": cfg.model_name
     }
 
-    if cfg.encoder_type.lower() == "gru":
-        encoder_config.update(
-            {
-                "vocab_size": cfg.vocab_size,
-                "emb_dim": cfg.text_emb_dim,
-                "hidden_dim": cfg.text_emb_dim,
-                "pad_token_id": 0,
-            }
-        )
-    elif cfg.encoder_type.lower() == "bert":
-        encoder_config.update(
-            {
-                "model_name": "bert-base-uncased",
-                "output_dim": cfg.text_emb_dim,
-                "freeze": True,
-            }
-        )
-    else:
-        raise ValueError(f"Unknown encoder_type: {cfg.encoder_type}")
+    print(f"🔍 开始扫描数据目录: {cfg.event_data_dir} ...")
 
+    for json_path in json_files:
+        # json_path = "data/4264473811.json"
+        filename = os.path.basename(json_path)  # "4264473811.json"
+        
+        # 提取 ID (去除后缀)
+        event_id = os.path.splitext(filename)[0] # "4264473811"
+        
+        # 排除非数据文件 (比如 cluster_info.json 如果也在同个目录)
+        if "cluster" in event_id or "profile" in event_id:
+            continue
+
+        # 2. 自动构建其他两个文件的路径
+        traj_path = os.path.join(cfg.state_trajectory_dir, f"{event_id}_trajectory.csv")
+        mf_path = os.path.join(cfg.mf_dir, f"{event_id}_mf.csv")
+        
+        # 3. 检查文件是否存在
+        if not os.path.exists(traj_path):
+            print(f"⚠️ 跳过 {event_id}: 缺少 {traj_path}")
+            continue
+        if not os.path.exists(mf_path):
+            print(f"⚠️ 跳过 {event_id}: 缺少 {mf_path}")
+            continue
+            
+        # 4. 实例化单个 Dataset
+        try:
+            ds = StateTransitionDataset(
+                trajectory_path=traj_path,
+                mf_path=mf_path,
+                test_data_path=json_path,
+                profile_path=cfg.profile_path,
+                encoder_config=encoder_config,
+                file_config=file_config,
+                batch_size=cfg.num_agents
+            )
+            dataset_list.append(ds)
+        except Exception as e:
+            print(f"❌ 加载 {event_id} 失败: {e}")
+
+    if not dataset_list:
+        raise RuntimeError("没有成功加载任何有效的数据集！")
+
+    print(f"✅ 成功加载 {len(dataset_list)} 个事件的数据集")
+    
+    # 5. 合并
+    full_dataset = ConcatDataset(dataset_list)
+    return full_dataset
+
+def build_dataloader(cfg: TrainConfig, tokenizer) -> DataLoader:
+    """
+    构建 DataLoader
+    注意：Dataset 初始化时需要传入 num_agents (即原 batch_size)
+    """
+    
+    # 构建 file_config 字典传递给 Dataset
+    file_config = {
+        'cluser_user_profile': cfg.profile_path,
+        'uid_mapping_path': cfg.uid_mapping_path,
+        'cluster_info_path': cfg.cluster_info_path
+    }
+    
+    # dataset处理了profile vector，但是mf摘要还是text
+    encoder_config = {
+        "type": cfg.encoder_type,
+        "model_name": cfg.model_name
+    }
+
+    dataset = StateTransitionDataset(
+        trajectory_path=cfg.trajectory_path,
+        mf_path=cfg.mf_path,
+        test_data_path=cfg.test_data_path,
+        profile_path=cfg.profile_path,
+        encoder_config=encoder_config,
+        file_config=file_config,
+        batch_size=cfg.num_agents
+    )
+
+    # 使用默认 collate_fn 即可，因为 Dataset 返回的都是 Tensor 或 String
+    # mu_prev: Tensor(3) -> Stack -> (B, 3)
+    # mf_text: String -> List[String] (长度 B)
+    # profile_vecs: Tensor(N, D) -> Stack -> (B, N, D)
+    # target_dist: Tensor(3) -> Stack -> (B, 3)
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.train_batch_size,
+        shuffle=True,
+        num_workers=0 # 调试时设为0，避免多进程报错
+    )
+    
+    return loader
+
+def build_models(cfg: TrainConfig):
+    # 1. 文本编码器 (用于处理环境文本 mf_text)
+    encoder_config = {
+        "type": cfg.encoder_type,
+        "model_name": cfg.model_name,
+        "output_dim": cfg.text_emb_dim,
+        "freeze": False # 训练时是否微调 BERT
+    }
     text_encoder = build_text_encoder(encoder_config)
 
+    # 2. 状态转移网络
     state_net = StateTransitionNet(
         agent_feat_dim=cfg.agent_feat_dim,
         text_emb_dim=cfg.text_emb_dim,
@@ -121,11 +218,6 @@ def build_models(cfg: TrainConfig):
 
     return text_encoder, state_net
 
-
-# ============================================================
-# 单个 epoch 的训练
-# ============================================================
-
 def train_one_epoch(
     epoch: int,
     cfg: TrainConfig,
@@ -134,140 +226,133 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     train_loader: DataLoader,
 ):
-    device = cfg.device
     text_encoder.train()
     state_net.train()
-
+    
     total_loss = 0.0
-    total_batches = 0
+    total_steps = 0
 
-    for batch_idx, batch in enumerate(train_loader):
-        mu_prev = batch["mu_prev"].to(device)             # (B, 3)
-        mu_t = batch["mu_t"].to(device)                   # (B, 3)
-        text_ids = batch["text_ids"].to(device)           # (B, L_max)
-        attention_mask = batch["attention_mask"].to(device)
+    for batch_idx, batch_data in enumerate(train_loader):
+        # 1. 解包数据并送入设备
+        # Dataset 返回字典: {"mu_prev": ..., "mf_text": ..., "profile_vecs": ..., "target_dist": ...}
+        
+        mu_prev = batch_data["mu_prev"].to(cfg.device)        # (B, 3)
+        target_dist = batch_data["target_dist"].to(cfg.device) # (B, 3)
+        agent_feats = batch_data["profile_vecs"].to(cfg.device) # (B, N, D_u) (B, 16, 768)
+        
+        mf_texts = batch_data["mf_text"] # List[str] of length B
+        
+        # 2. 处理环境文本 -> Embedding
+        # 这里需要手动 Tokenize，因为 Dataset 返回的是 raw text
+        # text_encoder 内部通常封装了 tokenizer 还是只封装了 model?
+        # 假设 text_encoder.tokenizer 是可用的 (来自 build_text_encoder)
+        
+        tokenizer = text_encoder.tokenizer 
+        tokenized_inputs = tokenizer(
+            mf_texts, 
+            padding=True, 
+            truncation=True, 
+            max_length=128, 
+            return_tensors="pt"
+        ).to(cfg.device)
+        
+        # 获取环境文本向量 (B, D_c)
+        # 假设 text_encoder 的 forward 接受 input_ids, attention_mask
+        # 并且返回 pooled output
+        if cfg.encoder_type == 'bert':
+            # 兼容 huggingface style
+            text_emb = text_encoder(tokenized_inputs['input_ids'], tokenized_inputs['attention_mask'])
+            if isinstance(text_emb, tuple): text_emb = text_emb[0]
+        else:
+            # 如果是 GRU 等自定义 encoder
+             text_emb = text_encoder(tokenized_inputs['input_ids'])
 
-        agent_features_list = [
-            feats.to(device) for feats in batch["agent_features_list"]
-        ]  # list of (N_i, d_u)
+        # 3. 状态转移网络前向传播
+        # 输入: mu_prev(B, 3), text_emb(B, D_c), agent_feats(B, N, D_u)
+        # 输出: mu_pred(B, 3), probs(B, N, 3)
+        mu_pred, _ = state_net(mu_prev, text_emb, agent_feats)
 
-        # 1. 文本平均场编码 C_{t-1}
-        text_emb = text_encoder(text_ids, attention_mask)  # (B, d_c)
+        # 4. 计算 Loss
+        # mse计算均值，这里先用KL算
+        # loss = F.mse_loss(mu_pred, target_dist)
+        log_mu_pred = torch.log(mu_pred + 1e-8) # 加微小值防止 log(0)
+        loss = F.kl_div(log_mu_pred, target_dist, reduction='batchmean')
 
-        # 2. 状态转移网络 → 预测 μ̂_t
-        mu_pred, _ = state_net(mu_prev, text_emb, agent_features_list)  # (B, 3)
-
-        # 3. Loss: MSE or KL
-        loss = F.mse_loss(mu_pred, mu_t)
-
+        # 5. 反向传播
         optimizer.zero_grad()
         loss.backward()
 
-        if cfg.grad_clip is not None and cfg.grad_clip > 0:
+        if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 list(text_encoder.parameters()) + list(state_net.parameters()),
-                max_norm=cfg.grad_clip,
+                cfg.grad_clip
             )
 
         optimizer.step()
 
         total_loss += loss.item()
-        total_batches += 1
+        total_steps += 1
 
         if (batch_idx + 1) % cfg.log_interval == 0:
-            avg_loss = total_loss / total_batches
-            print(
+            logger.info(
                 f"[Epoch {epoch}] Step {batch_idx+1}/{len(train_loader)} "
-                f"Loss: {loss.item():.6f} (avg: {avg_loss:.6f})"
+                f"Loss: {loss.item():.6f} (Avg: {total_loss/total_steps:.6f})"
             )
 
-    avg_loss = total_loss / max(1, total_batches)
-    print(f"[Epoch {epoch}] Training finished. Avg Loss: {avg_loss:.6f}")
+    avg_loss = total_loss / max(1, total_steps)
+    logger.info(f"[Epoch {epoch}] Finished. Avg Loss: {avg_loss:.6f}")
     return avg_loss
 
-
-# ============================================================
-# 保存 & 主训练逻辑
-# ============================================================
-
-def save_checkpoint(
-    cfg: TrainConfig,
-    text_encoder: torch.nn.Module,
-    state_net: torch.nn.Module,
-    epoch: int,
-    avg_loss: float,
-):
+def save_checkpoint(cfg, text_encoder, state_net, epoch, loss):
     os.makedirs(cfg.save_dir, exist_ok=True)
     save_path = os.path.join(cfg.save_dir, cfg.save_name)
-
-    ckpt = {
-        "epoch": epoch,
-        "avg_loss": avg_loss,
-        "text_encoder_state": text_encoder.state_dict(),
-        "state_net_state": state_net.state_dict(),
-        "config": cfg.__dict__,
-    }
-
-    torch.save(ckpt, save_path)
-    print(f"Checkpoint saved to {save_path}")
-
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': state_net.state_dict(),
+        'encoder_state_dict': text_encoder.state_dict(),
+        'loss': loss,
+        'config': str(cfg)
+    }, save_path)
+    logger.info(f"Checkpoint saved: {save_path}")
 
 def main():
     parser = argparse.ArgumentParser()
-    # 这里可以加命令行参数覆盖默认配置
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--encoder_type", type=str, default="gru")  # or "bert"
+    parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
     args = parser.parse_args()
 
-    cfg = TrainConfig(
-        num_epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        encoder_type=args.encoder_type,
-    )
-
-    print("=== TrainConfig ===")
-    print(cfg)
-
-    device = cfg.device
-    print(f"Using device: {device}")
-
-    # 1. DataLoader
-    train_loader = build_dataloader(cfg)
-
-    # 2. 模型
+    # 初始化配置
+    cfg = TrainConfig()
+    cfg.num_epochs = args.epochs
+    cfg.train_batch_size = args.batch_size
+    
+    logger.info(f"Device: {cfg.device}")
+    
+    # 1. 构建模型
     text_encoder, state_net = build_models(cfg)
-    text_encoder.to(device)
-    state_net.to(device)
+    text_encoder.to(cfg.device)
+    state_net.to(cfg.device)
+    
+    # 2. 构建 DataLoader
+    # 此时传入 text_encoder 的 tokenizer 用于 dataset 内部处理画像
+    # (如果 Dataset 内部需要处理画像文本的话)
+    train_loader = build_dataloader(cfg, getattr(text_encoder, 'tokenizer', None))
 
     # 3. 优化器
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         list(text_encoder.parameters()) + list(state_net.parameters()),
         lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
+        weight_decay=cfg.weight_decay
     )
 
-    best_loss = float("inf")
-
+    # 4. 训练循环
+    best_loss = float('inf')
     for epoch in range(1, cfg.num_epochs + 1):
-        avg_loss = train_one_epoch(
-            epoch,
-            cfg,
-            text_encoder,
-            state_net,
-            optimizer,
-            train_loader,
-        )
-
-        # 简单：按最优 loss 存一次
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_checkpoint(cfg, text_encoder, state_net, epoch, avg_loss)
-
-    print("Training finished.")
-
+        loss = train_one_epoch(epoch, cfg, text_encoder, state_net, optimizer, train_loader)
+        
+        if loss < best_loss:
+            best_loss = loss
+            save_checkpoint(cfg, text_encoder, state_net, epoch, loss)
 
 if __name__ == "__main__":
     main()
