@@ -1,0 +1,4 @@
+batch_id,processed_count,mean_field_state,batch_avg,batch_ratio_pos,batch_ratio_neu,batch_ratio_neg,cum_ratio_pos,cum_ratio_neu,cum_ratio_neg,injected_shares_batch
+0,16.0,-0.4375,-0.4375,0.0,0.5625,0.4375,0.0,0.5625,0.4375,0.0
+1,32.0,-0.34375,-0.25,0.125,0.5,0.375,0.0625,0.53125,0.40625,0.0
+2,48.0,-0.25,-0.0625,0.125,0.6875,0.1875,0.08333333333333333,0.5833333333333334,0.3333333333333333,0.0
