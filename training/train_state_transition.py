@@ -1,6 +1,7 @@
 # train_state_transition.py
 # 路径: MFSim/training/train_state_transition.py
 
+import datetime
 import os
 import sys
 import argparse
@@ -48,7 +49,7 @@ class TrainConfig:
     use_layernorm: bool = True
     
     train_batch_size: int = 32
-    max_event: int = 2
+    max_event: int = 100
     num_agents: int = 16 
     num_epochs: int = 20
     lr: float = 2e-5
@@ -203,19 +204,12 @@ def train_one_epoch(
 
     for batch_idx, batch_data in enumerate(train_loader):
         # 1. 解包数据并送入设备
-        # Dataset 返回字典: {"mu_prev": ..., "mf_text": ..., "profile_vecs": ..., "target_dist": ...}
-        
         mu_prev = batch_data["mu_prev"].to(cfg.device)        # (B, 3)
         target_dist = batch_data["target_dist"].to(cfg.device) # (B, 3)
-        agent_feats = batch_data["profile_vecs"].to(cfg.device) # (B, N, D_u) (B, 16, 768)
-        
-        mf_texts = batch_data["mf_text"] # List[str] of length B
+        agent_feats = batch_data["profile_vecs"].to(cfg.device) # (B, N, D_u)
+        mf_texts = batch_data["mf_text"] # List[str]
         
         # 2. 处理环境文本 -> Embedding
-        # 这里需要手动 Tokenize，因为 Dataset 返回的是 raw text
-        # text_encoder 内部通常封装了 tokenizer 还是只封装了 model?
-        # 假设 text_encoder.tokenizer 是可用的 (来自 build_text_encoder)
-        
         tokenizer = text_encoder.tokenizer 
         tokenized_inputs = tokenizer(
             mf_texts, 
@@ -225,31 +219,43 @@ def train_one_epoch(
             return_tensors="pt"
         ).to(cfg.device)
         
-        # 获取环境文本向量 (B, D_c)
-        # 假设 text_encoder 的 forward 接受 input_ids, attention_mask
-        # 并且返回 pooled output
         if cfg.encoder_type == 'bert':
-            # 兼容 huggingface style
             text_emb = text_encoder(tokenized_inputs['input_ids'], tokenized_inputs['attention_mask'])
             if isinstance(text_emb, tuple): text_emb = text_emb[0]
         else:
-            # 如果是 GRU 等自定义 encoder
              text_emb = text_encoder(tokenized_inputs['input_ids'])
 
         # 3. 状态转移网络前向传播
-        # 输入: mu_prev(B, 3), text_emb(B, D_c), agent_feats(B, N, D_u)
-        # 输出: mu_pred(B, 3), probs(B, N, 3)
         mu_pred, _ = state_net(mu_prev, text_emb, agent_feats)
 
-        # 4. 计算 Loss
-        # mse计算均值，这里先用KL算
-        # loss = F.mse_loss(mu_pred, target_dist)
-        log_mu_pred = torch.log(mu_pred + 1e-8) # 加微小值防止 log(0)
+        # 4. 计算 Loss (KL Divergence)
+        log_mu_pred = torch.log(mu_pred + 1e-8)
         loss = F.kl_div(log_mu_pred, target_dist, reduction='batchmean')
+
+        # ==========================================================
+        # [新增] 计算辅助指标 (不参与梯度回传，使用 no_grad)
+        # ==========================================================
+        with torch.no_grad():
+            # A. MAE (平均绝对误差): 直观理解概率偏离了多少
+            mae = F.l1_loss(mu_pred, target_dist).item()
+
+            # B. Trend Accuracy (趋势准确率): 预测的主要方向(Pos/Neu/Neg)是否对齐
+            pred_label = torch.argmax(mu_pred, dim=1)
+            target_label = torch.argmax(target_dist, dim=1)
+            acc = (pred_label == target_label).float().mean().item()
 
         # 5. 反向传播
         optimizer.zero_grad()
         loss.backward()
+
+        # ==========================================================
+        # [新增] 计算梯度范数 (用于监控梯度爆炸/消失)
+        # ==========================================================
+        grad_norm = 0.0
+        for p in list(text_encoder.parameters()) + list(state_net.parameters()):
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
 
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -259,9 +265,23 @@ def train_one_epoch(
 
         optimizer.step()
 
-        # 增加loss记录
+        # ==========================================================
+        # [新增] 写入 TensorBoard 多条曲线
+        # ==========================================================
         global_step = (epoch - 1) * len(train_loader) + batch_idx
-        writer.add_scalar('Loss/train', loss.item(), global_step)
+        
+        # 1. 训练损失 (最重要)
+        writer.add_scalar('Loss/train_kl', loss.item(), global_step)
+        
+        # 2. 业务指标 (给人看)
+        writer.add_scalar('Metric/MAE', mae, global_step)
+        writer.add_scalar('Metric/Accuracy', acc, global_step)
+        
+        # 3. 调试指标 (给开发者看)
+        writer.add_scalar('Debug/Grad_Norm', grad_norm, global_step)
+        # 监控学习率变化 (如果是动态学习率的话很有用)
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Debug/LR', current_lr, global_step)
 
         total_loss += loss.item()
         total_steps += 1
@@ -269,13 +289,12 @@ def train_one_epoch(
         if (batch_idx + 1) % cfg.log_interval == 0:
             logger.info(
                 f"[Epoch {epoch}] Step {batch_idx+1}/{len(train_loader)} "
-                f"Loss: {loss.item():.6f} (Avg: {total_loss/total_steps:.6f})"
+                f"Loss: {loss.item():.6f} | MAE: {mae:.4f} | Acc: {acc:.2%} | Grad: {grad_norm:.2f}"
             )
 
     avg_loss = total_loss / max(1, total_steps)
     logger.info(f"[Epoch {epoch}] Finished. Avg Loss: {avg_loss:.6f}")
     return avg_loss
-
 def save_checkpoint(cfg, text_encoder, state_net, epoch, loss):
     os.makedirs(cfg.save_dir, exist_ok=True)
     save_path = os.path.join(cfg.save_dir, cfg.save_name)
@@ -298,7 +317,9 @@ def main():
     cfg = TrainConfig()
     cfg.num_epochs = args.epochs
     cfg.train_batch_size = args.batch_size
-    writer = SummaryWriter(log_dir=os.path.join(cfg.save_dir, 'runs'))
+    
+    log_dir = f"checkpoints/runs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    writer = SummaryWriter(log_dir)
     
     logger.info(f"Device: {cfg.device}")
     
