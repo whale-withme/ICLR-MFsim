@@ -2,3 +2,4 @@
 checkpoints/*.pt
 checkpoints/*
 checkpoints_policy/checkpoints/*.pt
+**/*.pt
