@@ -151,10 +151,12 @@ def _generate_mock_data():
 
     
 def main():
+    import os
+    import datetime
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="/root/qwen2-1.5B", help="HuggingFace model ID or local path")
     parser.add_argument("--data_path", type=str, default="/root/ICML/data/pre_policy", help="Path to training data json")
-    parser.add_argument("--output_dir", type=str, default="./checkpoints_policy", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./checkpoints_policy/", help="Output directory")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
@@ -162,8 +164,14 @@ def main():
     parser.add_argument("--lambda_coeff", type=float, default=1.0, help="Weight for trajectory prediction loss")
     parser.add_argument("--k_steps", type=int, default=10, help="Number of future steps to predict")
     parser.add_argument("--lora_rank", type=int, default=16)
-    
+    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     args = parser.parse_args()
+
+    # 生成带时间戳的tensorboard目录
+    beijing_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    log_dir = os.path.join(args.output_dir, "runs", f"run_{beijing_now.strftime('%Y%m%d_%H%M%S')}")
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir)
 
     # 1. 初始化 Tokenizer
     print(f"[INFO] Loading Tokenizer from {args.model_name}...")
@@ -221,6 +229,22 @@ def main():
     except Exception as e:
         print(f"[WARN] Could not print trainable parameters: {e}")
 
+    # ========== 断点续训 ===========
+    import glob
+    import torch
+    import os
+    start_epoch = 1
+    best_loss = float('inf')
+    last_ckpt_path = os.path.join(args.output_dir, "checkpoint_last.pt")
+    best_ckpt_path = os.path.join(args.output_dir, "policy_best.pt")
+    if args.resume and os.path.exists(last_ckpt_path):
+        print(f"[INFO] Loading checkpoint from {last_ckpt_path} ...")
+        checkpoint = torch.load(last_ckpt_path, map_location='cpu')
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('epoch', 1)
+        best_loss = checkpoint.get('best_loss', float('inf'))
+        print(f"[INFO] Resume from epoch {start_epoch}, best_loss={best_loss}")
+
     # 4. 配置训练参数
     print("[INFO] Setting up TrainingArguments ...")
     training_args = TrainingArguments(
@@ -232,7 +256,7 @@ def main():
         logging_steps=10,
         save_strategy="epoch",
         report_to="tensorboard",
-        logging_dir=f"{args.output_dir}/runs",
+        logging_dir=log_dir,
         bf16=True, # 强烈建议开启 BF16，如果显卡不支持请改为 fp16=True
         # --- 关键参数 ---
         # 必须设为 False！
@@ -261,14 +285,38 @@ def main():
 
     # 6. 开始训练
     print("[INFO] Starting training...")
-    try:
-        trainer.train()
-        print("[INFO] Training finished successfully.")
-    except Exception as e:
-        print(f"[ERROR] Training failed: {e}")
-        raise
+    best_metric = best_loss
+    for epoch in range(start_epoch, args.epochs + 1):
+        try:
+            # 训练一个epoch
+            train_result = trainer.train(resume_from_checkpoint=last_ckpt_path if (args.resume and epoch == start_epoch and os.path.exists(last_ckpt_path)) else None)
+            # 获取loss
+            metrics = train_result.metrics if hasattr(train_result, 'metrics') else {}
+            epoch_loss = metrics.get('train_loss', None)
+            print(f"[INFO] Epoch {epoch} finished. train_loss={epoch_loss}")
+        except Exception as e:
+            print(f"[ERROR] Training failed at epoch {epoch}: {e}")
+            raise
 
-    # 7. 保存模型
+        # 保存最后权重
+        print(f"[INFO] Saving last checkpoint to {last_ckpt_path}")
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'best_loss': best_metric
+        }, last_ckpt_path)
+
+        # 保存最优权重
+        if epoch_loss is not None and (epoch_loss < best_metric):
+            best_metric = epoch_loss
+            print(f"[INFO] Saving best checkpoint to {best_ckpt_path} (loss={best_metric})")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'best_loss': best_metric
+            }, best_ckpt_path)
+
+    # 7. 保存最终模型
     print(f"[INFO] Saving model to {args.output_dir} ...")
     try:
         # 调用 PolicyMLPModel 中自定义的 save_pretrained
@@ -278,6 +326,7 @@ def main():
     except Exception as e:
         print(f"[ERROR] Failed to save model or tokenizer: {e}")
         raise
+    writer.close()
     print("[INFO] Done!")
 
 if __name__ == "__main__":
